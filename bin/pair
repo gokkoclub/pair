@@ -97,28 +97,45 @@ if [[ -z "$TASK" ]]; then
 fi
 
 # --- timeout 互換（macOS対応）---
-if command -v timeout &>/dev/null; then
-  run_with_timeout() { timeout "$@"; }
-elif command -v gtimeout &>/dev/null; then
-  run_with_timeout() { gtimeout "$@"; }
-else
-  # macOS フォールバック: バックグラウンド + kill
-  run_with_timeout() {
-    local secs="$1"; shift
+# パイプ全体をタイムアウトさせるため、サブシェル + プロセスグループで管理
+run_with_timeout() {
+  local secs="$1"; shift
+  if command -v timeout &>/dev/null; then
+    timeout --signal=TERM "$secs" "$@"
+  elif command -v gtimeout &>/dev/null; then
+    gtimeout --signal=TERM "$secs" "$@"
+  else
     "$@" &
     local pid=$!
-    (
-      sleep "$secs"
-      kill "$pid" 2>/dev/null
-    ) &
+    ( sleep "$secs" && kill "$pid" 2>/dev/null ) &
     local watcher=$!
     wait "$pid" 2>/dev/null
     local exit_code=$?
     kill "$watcher" 2>/dev/null
     wait "$watcher" 2>/dev/null
     return $exit_code
-  }
-fi
+  fi
+}
+
+# パイプライン全体をタイムアウト付きで実行（サブシェルで囲む）
+run_pipeline_with_timeout() {
+  local secs="$1"; shift
+  local script="$1"
+  # サブシェルをバックグラウンドで実行し、プロセスグループごと管理
+  bash -c "$script" &
+  local pid=$!
+  (
+    sleep "$secs"
+    # プロセスグループ全体を kill（パイプの子プロセスも含む）
+    kill -- -"$pid" 2>/dev/null || kill "$pid" 2>/dev/null
+  ) &
+  local watcher=$!
+  wait "$pid" 2>/dev/null
+  local exit_code=$?
+  kill "$watcher" 2>/dev/null
+  wait "$watcher" 2>/dev/null
+  return $exit_code
+}
 
 # --- 前提チェック ---
 check_deps() {
@@ -145,71 +162,61 @@ run_claude() {
   local claude_args=(-p --output-format stream-json --verbose --permission-mode bypassPermissions)
   [[ -n "$CLAUDE_MODEL" ]] && claude_args+=(--model "$CLAUDE_MODEL")
 
-  local start_ts
-  start_ts=$(date +%s)
   log_claude "開始..."
 
-  # ストリーミングJSONをパースしながら進捗表示
-  run_with_timeout "$TIMEOUT" claude "${claude_args[@]}" "$prompt" 2>/dev/null \
-    | tee "$log_file" \
-    | while IFS= read -r line; do
-        # JSON パース（jq不要 - bashのみで軽量に）
-        local msg_type
-        msg_type=$(echo "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
+  # パイプライン全体をサブシェルで実行（タイムアウト対応）
+  local start_ts
+  start_ts=$(date +%s)
 
-        case "$msg_type" in
-          assistant)
-            # ツール使用を検出
-            if echo "$line" | grep -q '"type":"tool_use"'; then
-              local tool_name
-              tool_name=$(echo "$line" | sed -n 's/.*"name":"\([^"]*\)".*/\1/p' | head -1)
-              if [[ -n "$tool_name" ]]; then
-                local elapsed=$(( $(date +%s) - start_ts ))
-                echo -e "  ${DIM}[$(fmt_elapsed $elapsed)]${NC} ${BLUE}▶${NC} ${tool_name}"
-
-                # ファイル操作ならパスも表示
-                local file_path
-                file_path=$(echo "$line" | sed -n 's/.*"file_path":"\([^"]*\)".*/\1/p' | head -1)
-                if [[ -n "$file_path" ]]; then
-                  # 長いパスは短縮
-                  local short_path="${file_path##*/}"
-                  echo -e "  ${DIM}    → ${short_path}${NC}"
-                fi
-
-                # Bash コマンドなら表示
-                if [[ "$tool_name" == "Bash" ]]; then
-                  local cmd
-                  cmd=$(echo "$line" | sed -n 's/.*"command":"\([^"]*\)".*/\1/p' | head -1 | cut -c1-80)
-                  if [[ -n "$cmd" ]]; then
-                    echo -e "  ${DIM}    \$ ${cmd}${NC}"
+  (
+    claude "${claude_args[@]}" "$prompt" 2>/dev/null \
+      | tee "$log_file" \
+      | while IFS= read -r line; do
+          local msg_type
+          msg_type=$(echo "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
+          case "$msg_type" in
+            assistant)
+              if echo "$line" | grep -q '"type":"tool_use"'; then
+                local tool_name
+                tool_name=$(echo "$line" | sed -n 's/.*"name":"\([^"]*\)".*/\1/p' | head -1)
+                if [[ -n "$tool_name" ]]; then
+                  local elapsed=$(( $(date +%s) - start_ts ))
+                  echo -e "  \033[2m[$(fmt_elapsed $elapsed)]\033[0m \033[0;34m▶\033[0m ${tool_name}"
+                  local file_path
+                  file_path=$(echo "$line" | sed -n 's/.*"file_path":"\([^"]*\)".*/\1/p' | head -1)
+                  [[ -n "$file_path" ]] && echo -e "  \033[2m    → ${file_path##*/}\033[0m"
+                  if [[ "$tool_name" == "Bash" ]]; then
+                    local cmd
+                    cmd=$(echo "$line" | sed -n 's/.*"command":"\([^"]*\)".*/\1/p' | head -1 | cut -c1-80)
+                    [[ -n "$cmd" ]] && echo -e "  \033[2m    \$ ${cmd}\033[0m"
                   fi
                 fi
               fi
-            fi
+              ;;
+            result)
+              local elapsed=$(( $(date +%s) - start_ts ))
+              local cost turns
+              cost=$(echo "$line" | sed -n 's/.*"total_cost_usd":\([0-9.]*\).*/\1/p')
+              turns=$(echo "$line" | sed -n 's/.*"num_turns":\([0-9]*\).*/\1/p')
+              echo -e "  \033[0;34m✓\033[0m 完了 $(fmt_elapsed $elapsed) | ${turns:-?}ターン | \$${cost:-?}"
+              ;;
+          esac
+        done
+  ) &
+  local pipeline_pid=$!
 
-            # verbose で全テキスト表示
-            if [[ "$VERBOSE" == true ]]; then
-              local text
-              text=$(echo "$line" | sed -n 's/.*"text":"\([^"]*\)".*/\1/p' | head -1 | cut -c1-120)
-              [[ -n "$text" ]] && echo -e "  ${DIM}${text}${NC}"
-            fi
-            ;;
-          result)
-            local elapsed=$(( $(date +%s) - start_ts ))
-            local cost
-            cost=$(echo "$line" | sed -n 's/.*"total_cost_usd":\([0-9.]*\).*/\1/p')
-            local turns
-            turns=$(echo "$line" | sed -n 's/.*"num_turns":\([0-9]*\).*/\1/p')
-            echo -e "  ${BLUE}✓${NC} 完了 $(fmt_elapsed $elapsed) | ${turns:-?}ターン | \$${cost:-?}"
-            ;;
-        esac
-      done
+  # タイムアウト監視
+  (
+    sleep "$TIMEOUT"
+    kill -- -"$pipeline_pid" 2>/dev/null || kill "$pipeline_pid" 2>/dev/null
+    echo -e "  \033[0;31m✗\033[0m タイムアウト (${TIMEOUT}s)"
+  ) &
+  local watcher=$!
 
-  local exit_code=${PIPESTATUS[0]}
-  if [[ $exit_code -eq 124 ]]; then
-    log_error "タイムアウト (${TIMEOUT}s)"
-    return 1
-  fi
+  wait "$pipeline_pid" 2>/dev/null
+  local exit_code=$?
+  kill "$watcher" 2>/dev/null
+  wait "$watcher" 2>/dev/null
   return $exit_code
 }
 
@@ -222,62 +229,60 @@ run_codex() {
   local codex_args=(exec --full-auto --json)
   [[ -n "$CODEX_MODEL" ]] && codex_args+=(-m "$CODEX_MODEL")
 
-  local start_ts
-  start_ts=$(date +%s)
   log_codex "開始..."
 
-  run_with_timeout "$TIMEOUT" npx @openai/codex "${codex_args[@]}" "$prompt" 2>/dev/null \
-    | tee "$log_file" \
-    | while IFS= read -r line; do
-        local msg_type
-        msg_type=$(echo "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
+  local start_ts
+  start_ts=$(date +%s)
 
-        case "$msg_type" in
-          item.completed)
-            local item_type
-            item_type=$(echo "$line" | sed -n 's/.*"type":"\([^"]*\)".*"type":"\([^"]*\)".*/\2/p')
-            local elapsed=$(( $(date +%s) - start_ts ))
+  (
+    npx @openai/codex "${codex_args[@]}" "$prompt" 2>/dev/null \
+      | tee "$log_file" \
+      | while IFS= read -r line; do
+          local msg_type
+          msg_type=$(echo "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
+          case "$msg_type" in
+            item.completed)
+              local item_type
+              item_type=$(echo "$line" | sed -n 's/.*"type":"\([^"]*\)".*"type":"\([^"]*\)".*/\2/p')
+              local elapsed=$(( $(date +%s) - start_ts ))
+              case "$item_type" in
+                tool_call|function_call)
+                  local tool_name
+                  tool_name=$(echo "$line" | sed -n 's/.*"name":"\([^"]*\)".*/\1/p' | head -1)
+                  echo -e "  \033[2m[$(fmt_elapsed $elapsed)]\033[0m \033[0;32m▶\033[0m ${tool_name:-tool}"
+                  ;;
+                agent_message)
+                  ;;
+              esac
+              ;;
+            turn.completed)
+              local elapsed=$(( $(date +%s) - start_ts ))
+              local in_tokens out_tokens
+              in_tokens=$(echo "$line" | sed -n 's/.*"input_tokens":\([0-9]*\).*/\1/p')
+              out_tokens=$(echo "$line" | sed -n 's/.*"output_tokens":\([0-9]*\).*/\1/p')
+              echo -e "  \033[0;32m✓\033[0m ターン完了 $(fmt_elapsed $elapsed) | in:${in_tokens:-?} out:${out_tokens:-?}"
+              ;;
+            thread.completed|exec.completed)
+              local elapsed=$(( $(date +%s) - start_ts ))
+              echo -e "  \033[0;32m✓\033[0m 完了 $(fmt_elapsed $elapsed)"
+              ;;
+          esac
+        done
+  ) &
+  local pipeline_pid=$!
 
-            case "$item_type" in
-              tool_call|function_call)
-                local tool_name
-                tool_name=$(echo "$line" | sed -n 's/.*"name":"\([^"]*\)".*/\1/p' | head -1)
-                echo -e "  ${DIM}[$(fmt_elapsed $elapsed)]${NC} ${GREEN}▶${NC} ${tool_name:-tool}"
+  # タイムアウト監視
+  (
+    sleep "$TIMEOUT"
+    kill -- -"$pipeline_pid" 2>/dev/null || kill "$pipeline_pid" 2>/dev/null
+    echo -e "  \033[0;31m✗\033[0m タイムアウト (${TIMEOUT}s)"
+  ) &
+  local watcher=$!
 
-                if [[ "$VERBOSE" == true ]]; then
-                  local args
-                  args=$(echo "$line" | sed -n 's/.*"arguments":"\([^"]*\)".*/\1/p' | head -1 | cut -c1-100)
-                  [[ -n "$args" ]] && echo -e "  ${DIM}    ${args}${NC}"
-                fi
-                ;;
-              agent_message)
-                local text
-                text=$(echo "$line" | sed -n 's/.*"text":"\([^"]*\)".*/\1/p' | head -1 | cut -c1-120)
-                if [[ -n "$text" && "$VERBOSE" == true ]]; then
-                  echo -e "  ${DIM}${text}${NC}"
-                fi
-                ;;
-            esac
-            ;;
-          turn.completed)
-            local elapsed=$(( $(date +%s) - start_ts ))
-            local in_tokens out_tokens
-            in_tokens=$(echo "$line" | sed -n 's/.*"input_tokens":\([0-9]*\).*/\1/p')
-            out_tokens=$(echo "$line" | sed -n 's/.*"output_tokens":\([0-9]*\).*/\1/p')
-            echo -e "  ${GREEN}✓${NC} ターン完了 $(fmt_elapsed $elapsed) | in:${in_tokens:-?} out:${out_tokens:-?}"
-            ;;
-          thread.completed|exec.completed)
-            local elapsed=$(( $(date +%s) - start_ts ))
-            echo -e "  ${GREEN}✓${NC} 完了 $(fmt_elapsed $elapsed)"
-            ;;
-        esac
-      done
-
-  local exit_code=${PIPESTATUS[0]}
-  if [[ $exit_code -eq 124 ]]; then
-    log_error "タイムアウト (${TIMEOUT}s)"
-    return 1
-  fi
+  wait "$pipeline_pid" 2>/dev/null
+  local exit_code=$?
+  kill "$watcher" 2>/dev/null
+  wait "$watcher" 2>/dev/null
   return $exit_code
 }
 

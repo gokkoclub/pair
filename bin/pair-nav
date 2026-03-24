@@ -1,0 +1,428 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ============================================================
+# pair-nav - チェックポイント式ナビゲーター
+# ============================================================
+#
+# Claude（ドライバー）が作業するたびに、Codex（ナビゲーター）が
+# 自動的に差分をレビューしてフィードバックを返す。
+#
+# 使い方:
+#   pair-nav start              # ナビゲーターを有効化
+#   pair-nav stop               # ナビゲーターを無効化
+#   pair-nav status             # 状態確認
+#   pair-nav start --model o3   # Codex モデル指定
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+NAV_DIR=".pair-navigator"
+NAV_FEEDBACK="${NAV_DIR}/feedback.md"
+NAV_STATE="${NAV_DIR}/state.json"
+NAV_LOG="${NAV_DIR}/reviews.log"
+SETTINGS_FILE=".claude/settings.local.json"
+HOOK_DIR=".claude/hooks"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+DIM='\033[2m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+usage() {
+  cat <<'USAGE'
+Usage: pair-nav <command> [options]
+
+Commands:
+  start [--model MODEL]  ナビゲーターを有効化（hooks を設定）
+  stop                   ナビゲーターを無効化（hooks を削除）
+  status                 現在の状態を表示
+
+Options:
+  --model <model>        Codex のモデル (default: o3)
+  --context <text>       ナビゲーターへの追加コンテキスト
+
+仕組み:
+  1. Claude が1つのレスポンスを完了 (Stop hook)
+  2. 未レビューの変更があれば Codex が自動レビュー
+  3. 次の Claude のターンでフィードバックが注入される (UserPromptSubmit hook)
+USAGE
+  exit 0
+}
+
+# ============================================================
+# start - ナビゲーターを有効化
+# ============================================================
+cmd_start() {
+  local codex_model="o3"
+  local extra_context=""
+
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --model) codex_model="$2"; shift 2 ;;
+      --context) extra_context="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+
+  if ! git rev-parse --is-inside-work-tree &>/dev/null; then
+    echo -e "${RED}Error: git リポジトリ内で実行してください${NC}"
+    exit 1
+  fi
+
+  echo -e "${BOLD}╭──────────────────────────────────────╮${NC}"
+  echo -e "${BOLD}│  Codex ナビゲーター セットアップ     │${NC}"
+  echo -e "${BOLD}╰──────────────────────────────────────╯${NC}"
+  echo ""
+
+  # ディレクトリ作成
+  mkdir -p "$NAV_DIR" "$HOOK_DIR"
+  mkdir -p "$(dirname "$SETTINGS_FILE")"
+
+  # .gitignore に追加
+  if ! grep -q '.pair-navigator' .gitignore 2>/dev/null; then
+    echo '.pair-navigator/' >> .gitignore
+    echo -e "${DIM}  .gitignore に .pair-navigator/ を追加${NC}"
+  fi
+
+  # 状態ファイル作成
+  cat > "$NAV_STATE" <<EOF
+{
+  "enabled": true,
+  "codex_model": "${codex_model}",
+  "extra_context": "${extra_context}",
+  "last_review_commit": "$(git rev-parse HEAD 2>/dev/null || echo '')",
+  "started_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "review_count": 0
+}
+EOF
+
+  # フィードバックファイル初期化
+  : > "$NAV_FEEDBACK"
+
+  # --- Stop hook（Claude のターン完了後にレビュー）---
+  cat > "${HOOK_DIR}/pair-nav-review.sh" <<'HOOKSCRIPT'
+#!/usr/bin/env bash
+# pair-nav: Stop hook - Claude のターン完了後に Codex ナビゲーターレビュー
+set -euo pipefail
+
+NAV_DIR=".pair-navigator"
+NAV_STATE="${NAV_DIR}/state.json"
+NAV_FEEDBACK="${NAV_DIR}/feedback.md"
+NAV_LOG="${NAV_DIR}/reviews.log"
+
+# ナビゲーターが有効か確認
+[[ -f "$NAV_STATE" ]] || exit 0
+enabled=$(cat "$NAV_STATE" | grep -o '"enabled": *[a-z]*' | grep -o '[a-z]*$')
+[[ "$enabled" == "true" ]] || exit 0
+
+# 未コミットの変更があるか確認
+diff_output=$(git diff 2>/dev/null || true)
+diff_staged=$(git diff --cached 2>/dev/null || true)
+status_output=$(git status --short 2>/dev/null || true)
+
+# 変更なし → スキップ
+if [[ -z "$diff_output" && -z "$diff_staged" && -z "$status_output" ]]; then
+  exit 0
+fi
+
+# 前回レビューからの差分チェック
+last_commit=$(cat "$NAV_STATE" | grep -o '"last_review_commit": *"[^"]*"' | grep -o '"[^"]*"$' | tr -d '"')
+current_head=$(git rev-parse HEAD 2>/dev/null || echo '')
+
+# コミット済みの差分 + 未コミット差分
+all_diff=""
+if [[ -n "$last_commit" && -n "$current_head" && "$last_commit" != "$current_head" ]]; then
+  all_diff=$(git diff "${last_commit}..HEAD" 2>/dev/null || true)
+fi
+all_diff="${all_diff}${diff_output}${diff_staged}"
+
+# 差分が小さすぎたらスキップ（ノイズ防止）
+diff_lines=$(echo "$all_diff" | wc -l | tr -d ' ')
+if (( diff_lines < 3 )); then
+  exit 0
+fi
+
+# Codex モデル取得
+codex_model=$(cat "$NAV_STATE" | grep -o '"codex_model": *"[^"]*"' | grep -o '"[^"]*"$' | tr -d '"')
+extra_context=$(cat "$NAV_STATE" | grep -o '"extra_context": *"[^"]*"' | grep -o '"[^"]*"$' | tr -d '"')
+
+# 差分を制限（トークン節約）
+trimmed_diff=$(echo "$all_diff" | head -500)
+
+# レビュープロンプト
+review_prompt="あなたはペアプログラミングのナビゲーター（レビュアー）です。
+ドライバー（Claude Code）が以下の変更を行いました。
+
+コードを変更せず、重要なフィードバックだけを簡潔に（5行以内で）返してください。
+問題がなければ「LGTM」とだけ返してください。
+
+確認ポイント:
+- バグ・ロジックエラー
+- セキュリティ問題
+- 明らかな設計ミス
+- 忘れてそうなもの（テスト、エラーハンドリング等）
+
+些細なスタイルの問題は無視してください。
+
+${extra_context:+追加コンテキスト: ${extra_context}}
+
+変更:
+\`\`\`diff
+${trimmed_diff}
+\`\`\`
+
+ファイル状況:
+${status_output}"
+
+# Codex でレビュー実行
+review_result=""
+codex_args=(exec --full-auto)
+[[ -n "$codex_model" ]] && codex_args+=(-m "$codex_model")
+
+review_result=$(timeout 120 npx @openai/codex "${codex_args[@]}" "$review_prompt" 2>/dev/null || echo "(レビュータイムアウト)")
+
+# LGTM なら何もしない
+if echo "$review_result" | grep -qi "^LGTM$\|^LGTM[.!]$"; then
+  echo "[$(date +%H:%M:%S)] LGTM (${diff_lines} lines)" >> "$NAV_LOG"
+  # 状態更新
+  tmp=$(mktemp)
+  cat "$NAV_STATE" | sed "s/\"last_review_commit\": *\"[^\"]*\"/\"last_review_commit\": \"${current_head}\"/" > "$tmp"
+  mv "$tmp" "$NAV_STATE"
+  exit 0
+fi
+
+# フィードバックを書き出し
+cat > "$NAV_FEEDBACK" <<FEEDBACK
+## Codex ナビゲーター フィードバック
+_$(date +"%H:%M:%S") | ${diff_lines} lines reviewed_
+
+${review_result}
+FEEDBACK
+
+# ログ記録
+echo "[$(date +%H:%M:%S)] Review: ${diff_lines} lines → feedback written" >> "$NAV_LOG"
+
+# レビューカウント更新 + last_commit 更新
+review_count=$(cat "$NAV_STATE" | grep -o '"review_count": *[0-9]*' | grep -o '[0-9]*$')
+new_count=$((review_count + 1))
+tmp=$(mktemp)
+cat "$NAV_STATE" \
+  | sed "s/\"last_review_commit\": *\"[^\"]*\"/\"last_review_commit\": \"${current_head}\"/" \
+  | sed "s/\"review_count\": *[0-9]*/\"review_count\": ${new_count}/" \
+  > "$tmp"
+mv "$tmp" "$NAV_STATE"
+
+exit 0
+HOOKSCRIPT
+  chmod +x "${HOOK_DIR}/pair-nav-review.sh"
+
+  # --- UserPromptSubmit hook（フィードバック注入）---
+  cat > "${HOOK_DIR}/pair-nav-inject.sh" <<'HOOKSCRIPT'
+#!/usr/bin/env bash
+# pair-nav: UserPromptSubmit hook - ナビゲーターのフィードバックを注入
+set -euo pipefail
+
+NAV_FEEDBACK=".pair-navigator/feedback.md"
+
+# フィードバックファイルがあれば内容を出力（Claude のコンテキストに注入される）
+if [[ -f "$NAV_FEEDBACK" && -s "$NAV_FEEDBACK" ]]; then
+  echo ""
+  echo "━━━ Codex ナビゲーターからのフィードバック ━━━"
+  cat "$NAV_FEEDBACK"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo ""
+
+  # 読んだらクリア
+  : > "$NAV_FEEDBACK"
+fi
+
+exit 0
+HOOKSCRIPT
+  chmod +x "${HOOK_DIR}/pair-nav-inject.sh"
+
+  # --- settings.local.json にフック登録 ---
+  local existing_settings="{}"
+  [[ -f "$SETTINGS_FILE" ]] && existing_settings=$(cat "$SETTINGS_FILE")
+
+  # jq がなければ直接書く
+  if command -v jq &>/dev/null; then
+    echo "$existing_settings" | jq --arg hook_dir "$HOOK_DIR" '
+      .hooks.Stop = [
+        (.hooks.Stop // [] | .[] | select(.hooks[0].command | test("pair-nav") | not))
+      ] + [{
+        "matcher": "",
+        "hooks": [{
+          "type": "command",
+          "command": ($hook_dir + "/pair-nav-review.sh"),
+          "timeout": 180,
+          "statusMessage": "Codex ナビゲーター レビュー中..."
+        }]
+      }]
+      |
+      .hooks.UserPromptSubmit = [
+        (.hooks.UserPromptSubmit // [] | .[] | select(.hooks[0].command | test("pair-nav") | not))
+      ] + [{
+        "matcher": "",
+        "hooks": [{
+          "type": "command",
+          "command": ($hook_dir + "/pair-nav-inject.sh"),
+          "timeout": 5
+        }]
+      }]
+    ' > "$SETTINGS_FILE"
+  else
+    cat > "$SETTINGS_FILE" <<SETTINGS
+{
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${HOOK_DIR}/pair-nav-review.sh",
+            "timeout": 180,
+            "statusMessage": "Codex ナビゲーター レビュー中..."
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${HOOK_DIR}/pair-nav-inject.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
+SETTINGS
+  fi
+
+  echo -e "${GREEN}✓${NC} hooks 設定完了 (${SETTINGS_FILE})"
+  echo -e "${GREEN}✓${NC} レビュースクリプト (${HOOK_DIR}/pair-nav-review.sh)"
+  echo -e "${GREEN}✓${NC} 注入スクリプト (${HOOK_DIR}/pair-nav-inject.sh)"
+  echo ""
+  echo -e "${CYAN}動作フロー:${NC}"
+  echo -e "  1. ${BLUE}Claude${NC} が作業する（普通に対話）"
+  echo -e "  2. Claude のレスポンス完了 → ${GREEN}Codex${NC} が差分を自動レビュー"
+  echo -e "  3. 次のプロンプトで ${GREEN}Codex${NC} のフィードバックが注入される"
+  echo -e "  4. ${BLUE}Claude${NC} がフィードバックを見て改善"
+  echo ""
+  echo -e "${YELLOW}注意:${NC} Claude Code セッションを再起動すると hooks が読み込まれます"
+  echo -e "${DIM}モデル: ${codex_model} | ログ: ${NAV_LOG}${NC}"
+}
+
+# ============================================================
+# stop - ナビゲーターを無効化
+# ============================================================
+cmd_stop() {
+  echo -e "${BOLD}ナビゲーター停止中...${NC}"
+
+  # hooks 削除
+  rm -f "${HOOK_DIR}/pair-nav-review.sh" "${HOOK_DIR}/pair-nav-inject.sh"
+
+  # settings.local.json から pair-nav hooks を削除
+  if [[ -f "$SETTINGS_FILE" ]] && command -v jq &>/dev/null; then
+    local tmp
+    tmp=$(jq '
+      if .hooks then
+        .hooks.Stop = [.hooks.Stop // [] | .[] | select(.hooks[0].command | test("pair-nav") | not)]
+        | .hooks.UserPromptSubmit = [.hooks.UserPromptSubmit // [] | .[] | select(.hooks[0].command | test("pair-nav") | not)]
+        | if (.hooks.Stop | length) == 0 then del(.hooks.Stop) else . end
+        | if (.hooks.UserPromptSubmit | length) == 0 then del(.hooks.UserPromptSubmit) else . end
+        | if (.hooks | length) == 0 then del(.hooks) else . end
+      else . end
+    ' "$SETTINGS_FILE")
+    echo "$tmp" > "$SETTINGS_FILE"
+
+    # 空の設定なら削除
+    if [[ "$(cat "$SETTINGS_FILE")" == "{}" ]]; then
+      rm -f "$SETTINGS_FILE"
+    fi
+  elif [[ -f "$SETTINGS_FILE" ]]; then
+    rm -f "$SETTINGS_FILE"
+  fi
+
+  # 状態を無効に
+  if [[ -f "$NAV_STATE" ]]; then
+    if command -v jq &>/dev/null; then
+      local tmp
+      tmp=$(jq '.enabled = false' "$NAV_STATE")
+      echo "$tmp" > "$NAV_STATE"
+    fi
+  fi
+
+  echo -e "${GREEN}✓${NC} ナビゲーター停止完了"
+  echo -e "${DIM}レビューログは ${NAV_LOG} に残っています${NC}"
+
+  # レビュー統計
+  if [[ -f "$NAV_LOG" ]]; then
+    local total
+    total=$(wc -l < "$NAV_LOG" | tr -d ' ')
+    local lgtm
+    lgtm=$(grep -c "LGTM" "$NAV_LOG" 2>/dev/null || echo 0)
+    echo -e "${DIM}統計: ${total} レビュー (LGTM: ${lgtm})${NC}"
+  fi
+}
+
+# ============================================================
+# status - 状態確認
+# ============================================================
+cmd_status() {
+  if [[ ! -f "$NAV_STATE" ]]; then
+    echo -e "${DIM}ナビゲーター: 未設定${NC}"
+    return
+  fi
+
+  local enabled model started count
+  enabled=$(grep -o '"enabled": *[a-z]*' "$NAV_STATE" | grep -o '[a-z]*$')
+  model=$(grep -o '"codex_model": *"[^"]*"' "$NAV_STATE" | grep -o '"[^"]*"$' | tr -d '"')
+  started=$(grep -o '"started_at": *"[^"]*"' "$NAV_STATE" | grep -o '"[^"]*"$' | tr -d '"')
+  count=$(grep -o '"review_count": *[0-9]*' "$NAV_STATE" | grep -o '[0-9]*$')
+
+  if [[ "$enabled" == "true" ]]; then
+    echo -e "${GREEN}${BOLD}ナビゲーター: 有効${NC}"
+  else
+    echo -e "${RED}ナビゲーター: 停止中${NC}"
+  fi
+  echo -e "  モデル: ${model}"
+  echo -e "  開始: ${started}"
+  echo -e "  レビュー数: ${count}"
+
+  # 現在のフィードバック
+  if [[ -f "$NAV_FEEDBACK" && -s "$NAV_FEEDBACK" ]]; then
+    echo ""
+    echo -e "${YELLOW}未読フィードバック:${NC}"
+    cat "$NAV_FEEDBACK"
+  fi
+
+  # 最新ログ
+  if [[ -f "$NAV_LOG" ]]; then
+    echo ""
+    echo -e "${DIM}最新レビュー:${NC}"
+    tail -5 "$NAV_LOG" | sed 's/^/  /'
+  fi
+}
+
+# ============================================================
+# メイン
+# ============================================================
+COMMAND="${1:-}"
+shift || true
+
+case "$COMMAND" in
+  start)  cmd_start "$@" ;;
+  stop)   cmd_stop ;;
+  status) cmd_status ;;
+  -h|--help|"") usage ;;
+  *)      echo -e "${RED}Unknown command: ${COMMAND}${NC}"; usage ;;
+esac

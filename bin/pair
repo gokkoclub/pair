@@ -66,7 +66,7 @@ Options:
   --claude-first <bool>  Claude先攻 (default: true)
   --claude-model <model> Claude Code のモデル (例: opus, sonnet)
   --codex-model <model>  Codex のモデル (例: o3, o4-mini)
-  --timeout <seconds>    各ターンのタイムアウト秒 (default: 900)
+  --timeout <seconds>    各ターンのタイムアウト秒 (default: 900, 0=無制限)
   --verbose              全出力を表示
   --workdir <dir>        作業ディレクトリ (default: カレント)
   -h, --help             ヘルプ
@@ -206,18 +206,21 @@ run_claude() {
   ) &
   local pipeline_pid=$!
 
-  # タイムアウト監視
-  (
-    sleep "$TIMEOUT"
-    kill -- -"$pipeline_pid" 2>/dev/null || kill "$pipeline_pid" 2>/dev/null
-    echo -e "  \033[0;31m✗\033[0m タイムアウト (${TIMEOUT}s)"
-  ) &
-  local watcher=$!
+  # タイムアウト監視（0 = 無制限）
+  local watcher=""
+  if (( TIMEOUT > 0 )); then
+    (
+      sleep "$TIMEOUT"
+      kill -- -"$pipeline_pid" 2>/dev/null || kill "$pipeline_pid" 2>/dev/null
+      echo -e "  \033[0;31m✗\033[0m タイムアウト (${TIMEOUT}s)"
+    ) &
+    watcher=$!
+  fi
 
   wait "$pipeline_pid" 2>/dev/null
   local exit_code=$?
-  kill "$watcher" 2>/dev/null
-  wait "$watcher" 2>/dev/null
+  [[ -n "$watcher" ]] && kill "$watcher" 2>/dev/null
+  [[ -n "$watcher" ]] && wait "$watcher" 2>/dev/null
   return $exit_code
 }
 
@@ -272,18 +275,21 @@ run_codex() {
   ) &
   local pipeline_pid=$!
 
-  # タイムアウト監視
-  (
-    sleep "$TIMEOUT"
-    kill -- -"$pipeline_pid" 2>/dev/null || kill "$pipeline_pid" 2>/dev/null
-    echo -e "  \033[0;31m✗\033[0m タイムアウト (${TIMEOUT}s)"
-  ) &
-  local watcher=$!
+  # タイムアウト監視（0 = 無制限）
+  local watcher=""
+  if (( TIMEOUT > 0 )); then
+    (
+      sleep "$TIMEOUT"
+      kill -- -"$pipeline_pid" 2>/dev/null || kill "$pipeline_pid" 2>/dev/null
+      echo -e "  \033[0;31m✗\033[0m タイムアウト (${TIMEOUT}s)"
+    ) &
+    watcher=$!
+  fi
 
   wait "$pipeline_pid" 2>/dev/null
   local exit_code=$?
-  kill "$watcher" 2>/dev/null
-  wait "$watcher" 2>/dev/null
+  [[ -n "$watcher" ]] && kill "$watcher" 2>/dev/null
+  [[ -n "$watcher" ]] && wait "$watcher" 2>/dev/null
   return $exit_code
 }
 

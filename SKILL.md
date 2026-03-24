@@ -107,12 +107,7 @@ pair-nav stop                       # 無効化（統計表示）
 ## インストール
 
 ```bash
-./setup.sh
+git clone https://github.com/gokkoclub/pair.git /tmp/pair && /tmp/pair/setup.sh
 ```
 
-または:
-
-```bash
-install -m 755 bin/pair ~/.local/bin/pair
-install -m 755 bin/pair-nav ~/.local/bin/pair-nav
-```
+CLI（`~/.local/bin/`）とスキル（`~/.claude/skills/`）を両方インストールします。

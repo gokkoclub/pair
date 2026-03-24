@@ -18,6 +18,7 @@ ROUNDS=3                  # ラウンド数
 CLAUDE_FIRST=true         # true: Claude先攻, false: Codex先攻
 WORKDIR="$(pwd)"
 LOG_DIR=".pair-logs"
+HANDOFF=".pair-handoff.md" # ハンドオフメモ
 CLAUDE_MODEL=""           # 空ならデフォルト
 CODEX_MODEL=""            # 空ならデフォルト
 TIMEOUT=900               # タイムアウト秒 (デフォルト15分)
@@ -305,6 +306,52 @@ get_changes() {
   fi
 }
 
+# --- プロジェクトコンテキストを取得 ---
+get_project_context() {
+  local context=""
+  # CLAUDE.md があればプロジェクトルールとして渡す
+  if [[ -f "CLAUDE.md" ]]; then
+    context="${context}
+### プロジェクトルール (CLAUDE.md)
+$(head -50 CLAUDE.md)
+"
+  fi
+  # .claude/CLAUDE.md もチェック
+  if [[ -f ".claude/CLAUDE.md" ]]; then
+    context="${context}
+### プロジェクトルール (.claude/CLAUDE.md)
+$(head -50 .claude/CLAUDE.md)
+"
+  fi
+  echo "$context"
+}
+
+# --- ハンドオフメモを読む ---
+get_handoff() {
+  if [[ -f "$HANDOFF" && -s "$HANDOFF" ]]; then
+    echo "### パートナーからの引き継ぎメモ"
+    cat "$HANDOFF"
+  fi
+}
+
+# --- ハンドオフ指示（プロンプトに追加する共通テキスト）---
+HANDOFF_INSTRUCTION='
+
+作業完了後、必ず .pair-handoff.md に以下の形式で引き継ぎメモを書いてください:
+
+```markdown
+## やったこと
+- （変更内容を箇条書き）
+
+## 判断の理由
+- （なぜその方針にしたか、他の選択肢を選ばなかった理由）
+
+## 次のパートナーへ
+- （残タスク、注意点、改善すべき点）
+```
+
+これは次のパートナーが読むので、意図と文脈が伝わるように書いてください。'
+
 # --- コミット ---
 auto_commit() {
   local agent="$1"
@@ -344,130 +391,227 @@ setup() {
 # ============================================================
 
 mode_ping_pong() {
+  local project_ctx
+  project_ctx=$(get_project_context)
+
+  # ハンドオフ初期化
+  : > "$HANDOFF"
+
   for ((i=1; i<=ROUNDS; i++)); do
     log_step "ラウンド $i/$ROUNDS"
 
-    local changes
+    local changes handoff_content
     changes=$(get_changes)
+    handoff_content=$(get_handoff)
 
+    local first_agent second_agent first_runner second_runner
     if [[ "$CLAUDE_FIRST" == true ]]; then
-      run_claude "あなたはペアプログラミングの一員です。
-タスク: ${TASK}
-ラウンド: ${i}/${ROUNDS}
-
-${changes}
-
-このタスクに取り組んでください。コードを実装・改善してください。
-次のターンで別のAIがあなたの変更をレビュー・改善します。" "${LOG_DIR}/round${i}_claude.log"
-      auto_commit "claude" "$i"
-
-      local prev_diff
-      prev_diff=$(git diff HEAD~1 2>/dev/null | head -300 || echo '(初回)')
-
-      run_codex "あなたはペアプログラミングの一員です。
-タスク: ${TASK}
-ラウンド: ${i}/${ROUNDS}
-
-前のパートナー（Claude）の変更:
-$(git log -1 --format='%s' 2>/dev/null)
-${prev_diff}
-
-コードをレビューし、改善・拡張してください。バグがあれば修正してください。" "${LOG_DIR}/round${i}_codex.log"
-      auto_commit "codex" "$i"
+      first_agent="Claude" second_agent="Codex"
+      first_runner="run_claude" second_runner="run_codex"
     else
-      run_codex "あなたはペアプログラミングの一員です。
-タスク: ${TASK}
-ラウンド: ${i}/${ROUNDS}
+      first_agent="Codex" second_agent="Claude"
+      first_runner="run_codex" second_runner="run_claude"
+    fi
 
+    # --- 先攻のターン ---
+    $first_runner "あなたはペアプログラミングの${first_agent}（先攻）です。
+パートナーは ${second_agent} です。
+
+## タスク
+${TASK}
+
+## 状況
+ラウンド ${i}/${ROUNDS}
+
+${project_ctx}
+${handoff_content}
 ${changes}
 
-このタスクに取り組んでください。コードを実装・改善してください。" "${LOG_DIR}/round${i}_codex.log"
-      auto_commit "codex" "$i"
+## 指示
+このタスクに取り組んでください。コードを実装・改善してください。
+次のターンで ${second_agent} があなたの変更をレビュー・改善します。
+${HANDOFF_INSTRUCTION}" "${LOG_DIR}/round${i}_${first_agent,,}.log"
+    auto_commit "${first_agent,,}" "$i"
 
-      local prev_diff
-      prev_diff=$(git diff HEAD~1 2>/dev/null | head -300 || echo '(初回)')
+    # 先攻の diff + ハンドオフメモ取得
+    local prev_diff
+    prev_diff=$(git diff HEAD~1 2>/dev/null | head -300 || echo '(初回)')
+    handoff_content=$(get_handoff)
 
-      run_claude "あなたはペアプログラミングの一員です。
-タスク: ${TASK}
-ラウンド: ${i}/${ROUNDS}
+    # --- 後攻のターン ---
+    $second_runner "あなたはペアプログラミングの${second_agent}（後攻・レビュアー）です。
+パートナーは ${first_agent} です。
 
-前のパートナー（Codex）の変更:
-$(git log -1 --format='%s' 2>/dev/null)
+## タスク
+${TASK}
+
+## 状況
+ラウンド ${i}/${ROUNDS}
+
+${project_ctx}
+${handoff_content}
+
+### ${first_agent} の変更（今回のラウンド）
+$(git log -1 --format='コミット: %s' 2>/dev/null)
+\`\`\`diff
 ${prev_diff}
+\`\`\`
 
-コードをレビューし、改善・拡張してください。バグがあれば修正してください。" "${LOG_DIR}/round${i}_claude.log"
-      auto_commit "claude" "$i"
-    fi
+## 指示
+${first_agent} の変更をレビューし、以下の観点で改善してください:
+- バグ・ロジックエラーの修正
+- 足りない処理の追加（エラーハンドリング、バリデーション等）
+- コードの品質改善
+- ${first_agent} のハンドオフメモの「次のパートナーへ」に書かれた課題への対応
+
+${first_agent} の良い判断はそのまま維持してください。理由なく書き直さないでください。
+${HANDOFF_INSTRUCTION}" "${LOG_DIR}/round${i}_${second_agent,,}.log"
+    auto_commit "${second_agent,,}" "$i"
   done
 }
 
 mode_review() {
-  log_step "実装フェーズ"
+  local project_ctx
+  project_ctx=$(get_project_context)
+  : > "$HANDOFF"
 
+  local impl_agent review_agent impl_runner review_runner
   if [[ "$CLAUDE_FIRST" == true ]]; then
-    run_claude "以下のタスクを実装してください: ${TASK}" "${LOG_DIR}/implement.log"
-    auto_commit "claude" "implement"
-
-    log_step "レビューフェーズ"
-    local diff
-    diff=$(git diff HEAD~1 2>/dev/null | head -300 || git diff | head -300)
-
-    run_codex "以下の変更をレビューしてください。問題があれば修正してください:
-${diff}
-
-元のタスク: ${TASK}" "${LOG_DIR}/review.log"
-    auto_commit "codex" "review"
+    impl_agent="Claude" review_agent="Codex"
+    impl_runner="run_claude" review_runner="run_codex"
   else
-    run_codex "以下のタスクを実装してください: ${TASK}" "${LOG_DIR}/implement.log"
-    auto_commit "codex" "implement"
-
-    log_step "レビューフェーズ"
-    local diff
-    diff=$(git diff HEAD~1 2>/dev/null | head -300 || git diff | head -300)
-
-    run_claude "以下の変更をレビューしてください。問題があれば修正してください:
-${diff}
-
-元のタスク: ${TASK}" "${LOG_DIR}/review.log"
-    auto_commit "claude" "review"
+    impl_agent="Codex" review_agent="Claude"
+    impl_runner="run_codex" review_runner="run_claude"
   fi
+
+  log_step "実装フェーズ (${impl_agent})"
+  $impl_runner "あなたはペアプログラミングの実装担当です。
+
+## タスク
+${TASK}
+
+${project_ctx}
+
+## 指示
+タスクを実装してください。
+${HANDOFF_INSTRUCTION}" "${LOG_DIR}/implement.log"
+  auto_commit "${impl_agent,,}" "implement"
+
+  log_step "レビューフェーズ (${review_agent})"
+  local diff handoff_content
+  diff=$(git diff HEAD~1 2>/dev/null | head -300 || git diff | head -300)
+  handoff_content=$(get_handoff)
+
+  $review_runner "あなたはペアプログラミングのレビュアーです。
+${impl_agent} が実装したコードをレビューし、問題があれば修正してください。
+
+## タスク
+${TASK}
+
+${project_ctx}
+${handoff_content}
+
+### ${impl_agent} の変更
+\`\`\`diff
+${diff}
+\`\`\`
+
+## 指示
+- バグ・セキュリティ問題を修正
+- ${impl_agent} のハンドオフメモの「次のパートナーへ」に対応
+- 良い判断はそのまま維持。理由なく書き直さない
+${HANDOFF_INSTRUCTION}" "${LOG_DIR}/review.log"
+  auto_commit "${review_agent,,}" "review"
 }
 
 mode_implement_review() {
+  local project_ctx
+  project_ctx=$(get_project_context)
+  : > "$HANDOFF"
+
+  # Step 1: Claude 実装
   log_step "Step 1/3: 実装 (Claude)"
-  run_claude "以下のタスクを実装してください: ${TASK}" "${LOG_DIR}/step1_implement.log"
+  run_claude "あなたはペアプログラミングの実装担当です。
+
+## タスク
+${TASK}
+
+${project_ctx}
+
+## 指示
+タスクを実装してください。
+${HANDOFF_INSTRUCTION}" "${LOG_DIR}/step1_implement.log"
   auto_commit "claude" "implement"
 
+  # Step 2: Codex レビュー（コード変更なし、レビューのみ）
   log_step "Step 2/3: レビュー (Codex)"
-  local diff
+  local diff handoff_content
   diff=$(git diff HEAD~1 2>/dev/null | head -300 || echo "(初回実装)")
-  run_codex "以下のコード変更をレビューしてください。
-問題点・改善点を review.md に書き出してください。コードは変更しないでください。
+  handoff_content=$(get_handoff)
 
-変更内容:
+  run_codex "あなたはペアプログラミングのレビュアーです。
+コードを変更せず、レビュー結果を review.md に書き出してください。
+
+## タスク
+${TASK}
+
+${project_ctx}
+${handoff_content}
+
+### Claude の変更
+\`\`\`diff
 ${diff}
+\`\`\`
 
-元のタスク: ${TASK}" "${LOG_DIR}/step2_review.log"
+## レビュー観点
+review.md に以下の形式で書いてください:
+\`\`\`markdown
+## 良い点
+- （維持すべき判断）
+
+## 要修正
+- （バグ、ロジックエラー、セキュリティ問題）
+
+## 改善提案
+- （品質向上、パフォーマンス、テスト等）
+
+## 優先度
+1. （最も重要な修正）
+2. ...
+\`\`\`
+
+コードファイルは変更しないでください。review.md のみ書いてください。" "${LOG_DIR}/step2_review.log"
   auto_commit "codex" "review"
 
+  # Step 3: Claude がレビュー反映
   log_step "Step 3/3: 修正 (Claude)"
   local review_content=""
   [[ -f review.md ]] && review_content=$(cat review.md)
-  run_claude "Codexからのレビューを反映してコードを修正してください:
 
+  run_claude "あなたはペアプログラミングの実装担当です。
+Codex からのレビューを反映してコードを修正してください。
+
+## タスク
+${TASK}
+
+${project_ctx}
+
+### Codex のレビュー
 ${review_content}
 
-$(git diff HEAD~1 2>/dev/null | head -300 || echo '')
-
-元のタスク: ${TASK}" "${LOG_DIR}/step3_fix.log"
+## 指示
+- レビューの「要修正」は必ず対応
+- 「改善提案」は妥当なら対応、過剰なら見送ってよい
+- 修正理由を明確に。review.md は削除してよい
+${HANDOFF_INSTRUCTION}" "${LOG_DIR}/step3_fix.log"
   auto_commit "claude" "fix"
 }
 
 mode_parallel() {
-  local base_branch
+  local project_ctx base_branch
+  project_ctx=$(get_project_context)
   base_branch=$(git branch --show-current)
 
-  # worktree でブランチ分離
   local claude_dir codex_dir
   claude_dir=$(mktemp -d)
   codex_dir=$(mktemp -d)
@@ -483,11 +627,20 @@ mode_parallel() {
 
   log_step "並行実装（worktree分離）"
 
-  # 並行実行
   (
     cd "$claude_dir"
     log_claude "worktree: $claude_dir"
-    run_claude "以下のタスクを実装してください: ${TASK}" "${WORKDIR}/${LOG_DIR}/parallel_claude.log"
+    run_claude "あなたはペアプログラミングの Claude 担当です。
+Codex も同じタスクを並行で実装中です。後でマージされます。
+
+## タスク
+${TASK}
+
+${project_ctx}
+
+## 指示
+タスクを実装してください。
+${HANDOFF_INSTRUCTION}" "${WORKDIR}/${LOG_DIR}/parallel_claude.log"
     git add -A && git commit -m "pair: claude parallel" --no-verify 2>/dev/null || true
   ) &
   local claude_pid=$!
@@ -495,7 +648,15 @@ mode_parallel() {
   (
     cd "$codex_dir"
     log_codex "worktree: $codex_dir"
-    run_codex "以下のタスクを実装してください: ${TASK}" "${WORKDIR}/${LOG_DIR}/parallel_codex.log"
+    run_codex "あなたはペアプログラミングの Codex 担当です。
+Claude も同じタスクを並行で実装中です。後でマージされます。
+
+## タスク
+${TASK}
+
+${project_ctx}
+
+タスクを実装してください。" "${WORKDIR}/${LOG_DIR}/parallel_codex.log"
     git add -A && git commit -m "pair: codex parallel" --no-verify 2>/dev/null || true
   ) &
   local codex_pid=$!
@@ -503,18 +664,33 @@ mode_parallel() {
   wait $claude_pid || true
   wait $codex_pid || true
 
-  # マージ
+  # ハンドオフメモを読んでマージ判断に使う
+  local claude_handoff="" codex_handoff=""
+  [[ -f "${claude_dir}/.pair-handoff.md" ]] && claude_handoff=$(cat "${claude_dir}/.pair-handoff.md")
+  [[ -f "${codex_dir}/.pair-handoff.md" ]] && codex_handoff=$(cat "${codex_dir}/.pair-handoff.md")
+
   log_step "マージ"
   git merge pair-claude --no-edit 2>/dev/null || true
   git merge pair-codex --no-edit 2>/dev/null || {
     log_info "コンフリクト発生 → Claude に解決させます..."
-    run_claude "git merge のコンフリクトを解決してください。両方の実装の良い部分を残してください。
-タスク: ${TASK}" "${LOG_DIR}/merge_resolve.log"
+    run_claude "git merge のコンフリクトを解決してください。
+
+## タスク
+${TASK}
+
+### Claude の実装メモ
+${claude_handoff}
+
+### Codex の実装メモ
+${codex_handoff}
+
+## 指示
+両方の実装の良い部分を残してマージしてください。
+判断理由が明確な方を優先してください。" "${LOG_DIR}/merge_resolve.log"
     git add -A
     git commit -m "pair: merge resolution" --no-verify 2>/dev/null || true
   }
 
-  # クリーンアップ
   git worktree remove "$claude_dir" 2>/dev/null || true
   git worktree remove "$codex_dir" 2>/dev/null || true
   git branch -D pair-claude pair-codex 2>/dev/null || true

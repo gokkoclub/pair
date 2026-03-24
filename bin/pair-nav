@@ -182,7 +182,14 @@ review_result=""
 codex_args=(exec --full-auto)
 [[ -n "$codex_model" ]] && codex_args+=(-m "$codex_model")
 
-review_result=$(timeout 120 npx @openai/codex "${codex_args[@]}" "$review_prompt" 2>/dev/null || echo "(レビュータイムアウト)")
+# macOS 互換 timeout
+if command -v timeout &>/dev/null; then
+  review_result=$(timeout 120 npx @openai/codex "${codex_args[@]}" "$review_prompt" 2>/dev/null || echo "(レビュータイムアウト)")
+elif command -v gtimeout &>/dev/null; then
+  review_result=$(gtimeout 120 npx @openai/codex "${codex_args[@]}" "$review_prompt" 2>/dev/null || echo "(レビュータイムアウト)")
+else
+  review_result=$(npx @openai/codex "${codex_args[@]}" "$review_prompt" 2>/dev/null || echo "(レビュータイムアウト)")
+fi
 
 # LGTM なら何もしない
 if echo "$review_result" | grep -qi "^LGTM$\|^LGTM[.!]$"; then

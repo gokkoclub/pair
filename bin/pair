@@ -96,6 +96,30 @@ if [[ -z "$TASK" ]]; then
   usage
 fi
 
+# --- timeout 互換（macOS対応）---
+if command -v timeout &>/dev/null; then
+  run_with_timeout() { timeout "$@"; }
+elif command -v gtimeout &>/dev/null; then
+  run_with_timeout() { gtimeout "$@"; }
+else
+  # macOS フォールバック: バックグラウンド + kill
+  run_with_timeout() {
+    local secs="$1"; shift
+    "$@" &
+    local pid=$!
+    (
+      sleep "$secs"
+      kill "$pid" 2>/dev/null
+    ) &
+    local watcher=$!
+    wait "$pid" 2>/dev/null
+    local exit_code=$?
+    kill "$watcher" 2>/dev/null
+    wait "$watcher" 2>/dev/null
+    return $exit_code
+  }
+fi
+
 # --- 前提チェック ---
 check_deps() {
   if ! command -v claude &>/dev/null; then
@@ -126,7 +150,7 @@ run_claude() {
   log_claude "開始..."
 
   # ストリーミングJSONをパースしながら進捗表示
-  timeout "$TIMEOUT" claude "${claude_args[@]}" "$prompt" 2>/dev/null \
+  run_with_timeout "$TIMEOUT" claude "${claude_args[@]}" "$prompt" 2>/dev/null \
     | tee "$log_file" \
     | while IFS= read -r line; do
         # JSON パース（jq不要 - bashのみで軽量に）
@@ -202,7 +226,7 @@ run_codex() {
   start_ts=$(date +%s)
   log_codex "開始..."
 
-  timeout "$TIMEOUT" npx @openai/codex "${codex_args[@]}" "$prompt" 2>/dev/null \
+  run_with_timeout "$TIMEOUT" npx @openai/codex "${codex_args[@]}" "$prompt" 2>/dev/null \
     | tee "$log_file" \
     | while IFS= read -r line; do
         local msg_type

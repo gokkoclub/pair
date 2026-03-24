@@ -1,0 +1,535 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ============================================================
+# pair - Claude Code × Codex ペアプロ自動化
+# ============================================================
+#
+# 使い方:
+#   pair "認証機能を実装して"
+#   pair --mode review "リファクタリングして"
+#   pair --mode ping-pong --rounds 5 "APIエンドポイントを追加"
+#   pair --claude-first false "Codexに先に書かせたい"
+#   pair --timeout 600 "重いタスク"
+
+# --- デフォルト設定 ---
+MODE="ping-pong"          # ping-pong | review | implement-review | parallel
+ROUNDS=3                  # ラウンド数
+CLAUDE_FIRST=true         # true: Claude先攻, false: Codex先攻
+WORKDIR="$(pwd)"
+LOG_DIR=".pair-logs"
+CLAUDE_MODEL=""           # 空ならデフォルト
+CODEX_MODEL=""            # 空ならデフォルト
+TIMEOUT=900               # タイムアウト秒 (デフォルト15分)
+VERBOSE=false             # 全出力を表示
+
+# --- 色 ---
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+DIM='\033[2m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# --- ヘルパー ---
+log_claude()  { echo -e "${BLUE}${BOLD}[Claude]${NC} $*"; }
+log_codex()   { echo -e "${GREEN}${BOLD}[Codex]${NC} $*"; }
+log_info()    { echo -e "${CYAN}[Info]${NC} $*"; }
+log_step()    { echo -e "\n${YELLOW}${BOLD}━━━ $* ━━━${NC}"; }
+log_error()   { echo -e "${RED}[Error]${NC} $*" >&2; }
+log_dim()     { echo -e "${DIM}  $*${NC}"; }
+
+# 経過時間を見やすく
+fmt_elapsed() {
+  local sec="$1"
+  if (( sec < 60 )); then
+    echo "${sec}s"
+  else
+    echo "$((sec / 60))m$((sec % 60))s"
+  fi
+}
+
+usage() {
+  cat <<'USAGE'
+Usage: pair [OPTIONS] "タスクの説明"
+
+Options:
+  --mode <mode>          動作モード (default: ping-pong)
+                           ping-pong        : 交互に実装・改善
+                           review           : 片方が実装、もう片方がレビュー
+                           implement-review : Claude実装 → Codexレビュー → Claude修正
+                           parallel         : 両方同時に実装 → マージ
+  --rounds <n>           ラウンド数 (default: 3)
+  --claude-first <bool>  Claude先攻 (default: true)
+  --claude-model <model> Claude Code のモデル (例: opus, sonnet)
+  --codex-model <model>  Codex のモデル (例: o3, o4-mini)
+  --timeout <seconds>    各ターンのタイムアウト秒 (default: 900)
+  --verbose              全出力を表示
+  --workdir <dir>        作業ディレクトリ (default: カレント)
+  -h, --help             ヘルプ
+USAGE
+  exit 0
+}
+
+# --- 引数パース ---
+TASK=""
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --mode)          MODE="$2"; shift 2 ;;
+    --rounds)        ROUNDS="$2"; shift 2 ;;
+    --claude-first)  CLAUDE_FIRST="$2"; shift 2 ;;
+    --claude-model)  CLAUDE_MODEL="$2"; shift 2 ;;
+    --codex-model)   CODEX_MODEL="$2"; shift 2 ;;
+    --timeout)       TIMEOUT="$2"; shift 2 ;;
+    --verbose)       VERBOSE=true; shift ;;
+    --workdir)       WORKDIR="$2"; shift 2 ;;
+    -h|--help)       usage ;;
+    -*)              log_error "Unknown option: $1"; usage ;;
+    *)               TASK="$1"; shift ;;
+  esac
+done
+
+if [[ -z "$TASK" ]]; then
+  log_error "タスクを指定してください"
+  usage
+fi
+
+# --- 前提チェック ---
+check_deps() {
+  if ! command -v claude &>/dev/null; then
+    log_error "claude CLI が見つかりません"
+    exit 1
+  fi
+  if ! command -v npx &>/dev/null; then
+    log_error "npx が見つかりません"
+    exit 1
+  fi
+  if ! git rev-parse --is-inside-work-tree &>/dev/null; then
+    log_error "git リポジトリ内で実行してください"
+    exit 1
+  fi
+}
+
+# ============================================================
+# Claude ストリーミング実行（リアルタイム進捗表示）
+# ============================================================
+run_claude() {
+  local prompt="$1"
+  local log_file="$2"
+  local claude_args=(-p --output-format stream-json --verbose --permission-mode bypassPermissions)
+  [[ -n "$CLAUDE_MODEL" ]] && claude_args+=(--model "$CLAUDE_MODEL")
+
+  local start_ts
+  start_ts=$(date +%s)
+  log_claude "開始..."
+
+  # ストリーミングJSONをパースしながら進捗表示
+  timeout "$TIMEOUT" claude "${claude_args[@]}" "$prompt" 2>/dev/null \
+    | tee "$log_file" \
+    | while IFS= read -r line; do
+        # JSON パース（jq不要 - bashのみで軽量に）
+        local msg_type
+        msg_type=$(echo "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
+
+        case "$msg_type" in
+          assistant)
+            # ツール使用を検出
+            if echo "$line" | grep -q '"type":"tool_use"'; then
+              local tool_name
+              tool_name=$(echo "$line" | sed -n 's/.*"name":"\([^"]*\)".*/\1/p' | head -1)
+              if [[ -n "$tool_name" ]]; then
+                local elapsed=$(( $(date +%s) - start_ts ))
+                echo -e "  ${DIM}[$(fmt_elapsed $elapsed)]${NC} ${BLUE}▶${NC} ${tool_name}"
+
+                # ファイル操作ならパスも表示
+                local file_path
+                file_path=$(echo "$line" | sed -n 's/.*"file_path":"\([^"]*\)".*/\1/p' | head -1)
+                if [[ -n "$file_path" ]]; then
+                  # 長いパスは短縮
+                  local short_path="${file_path##*/}"
+                  echo -e "  ${DIM}    → ${short_path}${NC}"
+                fi
+
+                # Bash コマンドなら表示
+                if [[ "$tool_name" == "Bash" ]]; then
+                  local cmd
+                  cmd=$(echo "$line" | sed -n 's/.*"command":"\([^"]*\)".*/\1/p' | head -1 | cut -c1-80)
+                  if [[ -n "$cmd" ]]; then
+                    echo -e "  ${DIM}    \$ ${cmd}${NC}"
+                  fi
+                fi
+              fi
+            fi
+
+            # verbose で全テキスト表示
+            if [[ "$VERBOSE" == true ]]; then
+              local text
+              text=$(echo "$line" | sed -n 's/.*"text":"\([^"]*\)".*/\1/p' | head -1 | cut -c1-120)
+              [[ -n "$text" ]] && echo -e "  ${DIM}${text}${NC}"
+            fi
+            ;;
+          result)
+            local elapsed=$(( $(date +%s) - start_ts ))
+            local cost
+            cost=$(echo "$line" | sed -n 's/.*"total_cost_usd":\([0-9.]*\).*/\1/p')
+            local turns
+            turns=$(echo "$line" | sed -n 's/.*"num_turns":\([0-9]*\).*/\1/p')
+            echo -e "  ${BLUE}✓${NC} 完了 $(fmt_elapsed $elapsed) | ${turns:-?}ターン | \$${cost:-?}"
+            ;;
+        esac
+      done
+
+  local exit_code=${PIPESTATUS[0]}
+  if [[ $exit_code -eq 124 ]]; then
+    log_error "タイムアウト (${TIMEOUT}s)"
+    return 1
+  fi
+  return $exit_code
+}
+
+# ============================================================
+# Codex ストリーミング実行（リアルタイム進捗表示）
+# ============================================================
+run_codex() {
+  local prompt="$1"
+  local log_file="$2"
+  local codex_args=(exec --full-auto --json)
+  [[ -n "$CODEX_MODEL" ]] && codex_args+=(-m "$CODEX_MODEL")
+
+  local start_ts
+  start_ts=$(date +%s)
+  log_codex "開始..."
+
+  timeout "$TIMEOUT" npx @openai/codex "${codex_args[@]}" "$prompt" 2>/dev/null \
+    | tee "$log_file" \
+    | while IFS= read -r line; do
+        local msg_type
+        msg_type=$(echo "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
+
+        case "$msg_type" in
+          item.completed)
+            local item_type
+            item_type=$(echo "$line" | sed -n 's/.*"type":"\([^"]*\)".*"type":"\([^"]*\)".*/\2/p')
+            local elapsed=$(( $(date +%s) - start_ts ))
+
+            case "$item_type" in
+              tool_call|function_call)
+                local tool_name
+                tool_name=$(echo "$line" | sed -n 's/.*"name":"\([^"]*\)".*/\1/p' | head -1)
+                echo -e "  ${DIM}[$(fmt_elapsed $elapsed)]${NC} ${GREEN}▶${NC} ${tool_name:-tool}"
+
+                if [[ "$VERBOSE" == true ]]; then
+                  local args
+                  args=$(echo "$line" | sed -n 's/.*"arguments":"\([^"]*\)".*/\1/p' | head -1 | cut -c1-100)
+                  [[ -n "$args" ]] && echo -e "  ${DIM}    ${args}${NC}"
+                fi
+                ;;
+              agent_message)
+                local text
+                text=$(echo "$line" | sed -n 's/.*"text":"\([^"]*\)".*/\1/p' | head -1 | cut -c1-120)
+                if [[ -n "$text" && "$VERBOSE" == true ]]; then
+                  echo -e "  ${DIM}${text}${NC}"
+                fi
+                ;;
+            esac
+            ;;
+          turn.completed)
+            local elapsed=$(( $(date +%s) - start_ts ))
+            local in_tokens out_tokens
+            in_tokens=$(echo "$line" | sed -n 's/.*"input_tokens":\([0-9]*\).*/\1/p')
+            out_tokens=$(echo "$line" | sed -n 's/.*"output_tokens":\([0-9]*\).*/\1/p')
+            echo -e "  ${GREEN}✓${NC} ターン完了 $(fmt_elapsed $elapsed) | in:${in_tokens:-?} out:${out_tokens:-?}"
+            ;;
+          thread.completed|exec.completed)
+            local elapsed=$(( $(date +%s) - start_ts ))
+            echo -e "  ${GREEN}✓${NC} 完了 $(fmt_elapsed $elapsed)"
+            ;;
+        esac
+      done
+
+  local exit_code=${PIPESTATUS[0]}
+  if [[ $exit_code -eq 124 ]]; then
+    log_error "タイムアウト (${TIMEOUT}s)"
+    return 1
+  fi
+  return $exit_code
+}
+
+# --- diff を取得（最大行数制限付き） ---
+get_changes() {
+  local diff status
+  diff=$(git diff 2>/dev/null | head -200 || true)
+  status=$(git status --short 2>/dev/null || true)
+  if [[ -n "$diff" || -n "$status" ]]; then
+    echo "### 現在の変更点"
+    echo '```diff'
+    echo "$diff"
+    echo '```'
+    echo "### ファイル状況"
+    echo '```'
+    echo "$status"
+    echo '```'
+  else
+    echo "(変更なし)"
+  fi
+}
+
+# --- コミット ---
+auto_commit() {
+  local agent="$1"
+  local round="$2"
+  if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
+    git add -A
+    git commit -m "pair: ${agent} round ${round}" --no-verify 2>/dev/null || true
+    local files_changed
+    files_changed=$(git diff --stat HEAD~1 2>/dev/null | tail -1)
+    log_info "コミット: ${agent} round ${round} (${files_changed})"
+  else
+    log_dim "変更なし - コミットスキップ"
+  fi
+}
+
+# --- セットアップ ---
+setup() {
+  cd "$WORKDIR"
+  mkdir -p "$LOG_DIR"
+
+  if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
+    git add -A
+    git commit -m "pair: initial state" --no-verify 2>/dev/null || true
+  fi
+
+  echo ""
+  echo -e "${BOLD}╭──────────────────────────────────────╮${NC}"
+  echo -e "${BOLD}│  Claude × Codex ペアプロ             │${NC}"
+  echo -e "${BOLD}╰──────────────────────────────────────╯${NC}"
+  echo ""
+  log_info "タスク: ${TASK:0:80}"
+  log_info "モード: $MODE | ラウンド: $ROUNDS | 先攻: $([ "$CLAUDE_FIRST" = true ] && echo 'Claude' || echo 'Codex') | タイムアウト: ${TIMEOUT}s"
+}
+
+# ============================================================
+# モード実装
+# ============================================================
+
+mode_ping_pong() {
+  for ((i=1; i<=ROUNDS; i++)); do
+    log_step "ラウンド $i/$ROUNDS"
+
+    local changes
+    changes=$(get_changes)
+
+    if [[ "$CLAUDE_FIRST" == true ]]; then
+      run_claude "あなたはペアプログラミングの一員です。
+タスク: ${TASK}
+ラウンド: ${i}/${ROUNDS}
+
+${changes}
+
+このタスクに取り組んでください。コードを実装・改善してください。
+次のターンで別のAIがあなたの変更をレビュー・改善します。" "${LOG_DIR}/round${i}_claude.log"
+      auto_commit "claude" "$i"
+
+      local prev_diff
+      prev_diff=$(git diff HEAD~1 2>/dev/null | head -300 || echo '(初回)')
+
+      run_codex "あなたはペアプログラミングの一員です。
+タスク: ${TASK}
+ラウンド: ${i}/${ROUNDS}
+
+前のパートナー（Claude）の変更:
+$(git log -1 --format='%s' 2>/dev/null)
+${prev_diff}
+
+コードをレビューし、改善・拡張してください。バグがあれば修正してください。" "${LOG_DIR}/round${i}_codex.log"
+      auto_commit "codex" "$i"
+    else
+      run_codex "あなたはペアプログラミングの一員です。
+タスク: ${TASK}
+ラウンド: ${i}/${ROUNDS}
+
+${changes}
+
+このタスクに取り組んでください。コードを実装・改善してください。" "${LOG_DIR}/round${i}_codex.log"
+      auto_commit "codex" "$i"
+
+      local prev_diff
+      prev_diff=$(git diff HEAD~1 2>/dev/null | head -300 || echo '(初回)')
+
+      run_claude "あなたはペアプログラミングの一員です。
+タスク: ${TASK}
+ラウンド: ${i}/${ROUNDS}
+
+前のパートナー（Codex）の変更:
+$(git log -1 --format='%s' 2>/dev/null)
+${prev_diff}
+
+コードをレビューし、改善・拡張してください。バグがあれば修正してください。" "${LOG_DIR}/round${i}_claude.log"
+      auto_commit "claude" "$i"
+    fi
+  done
+}
+
+mode_review() {
+  log_step "実装フェーズ"
+
+  if [[ "$CLAUDE_FIRST" == true ]]; then
+    run_claude "以下のタスクを実装してください: ${TASK}" "${LOG_DIR}/implement.log"
+    auto_commit "claude" "implement"
+
+    log_step "レビューフェーズ"
+    local diff
+    diff=$(git diff HEAD~1 2>/dev/null | head -300 || git diff | head -300)
+
+    run_codex "以下の変更をレビューしてください。問題があれば修正してください:
+${diff}
+
+元のタスク: ${TASK}" "${LOG_DIR}/review.log"
+    auto_commit "codex" "review"
+  else
+    run_codex "以下のタスクを実装してください: ${TASK}" "${LOG_DIR}/implement.log"
+    auto_commit "codex" "implement"
+
+    log_step "レビューフェーズ"
+    local diff
+    diff=$(git diff HEAD~1 2>/dev/null | head -300 || git diff | head -300)
+
+    run_claude "以下の変更をレビューしてください。問題があれば修正してください:
+${diff}
+
+元のタスク: ${TASK}" "${LOG_DIR}/review.log"
+    auto_commit "claude" "review"
+  fi
+}
+
+mode_implement_review() {
+  log_step "Step 1/3: 実装 (Claude)"
+  run_claude "以下のタスクを実装してください: ${TASK}" "${LOG_DIR}/step1_implement.log"
+  auto_commit "claude" "implement"
+
+  log_step "Step 2/3: レビュー (Codex)"
+  local diff
+  diff=$(git diff HEAD~1 2>/dev/null | head -300 || echo "(初回実装)")
+  run_codex "以下のコード変更をレビューしてください。
+問題点・改善点を review.md に書き出してください。コードは変更しないでください。
+
+変更内容:
+${diff}
+
+元のタスク: ${TASK}" "${LOG_DIR}/step2_review.log"
+  auto_commit "codex" "review"
+
+  log_step "Step 3/3: 修正 (Claude)"
+  local review_content=""
+  [[ -f review.md ]] && review_content=$(cat review.md)
+  run_claude "Codexからのレビューを反映してコードを修正してください:
+
+${review_content}
+
+$(git diff HEAD~1 2>/dev/null | head -300 || echo '')
+
+元のタスク: ${TASK}" "${LOG_DIR}/step3_fix.log"
+  auto_commit "claude" "fix"
+}
+
+mode_parallel() {
+  local base_branch
+  base_branch=$(git branch --show-current)
+
+  # worktree でブランチ分離
+  local claude_dir codex_dir
+  claude_dir=$(mktemp -d)
+  codex_dir=$(mktemp -d)
+
+  git worktree add "$claude_dir" -b pair-claude 2>/dev/null || {
+    git branch -D pair-claude 2>/dev/null || true
+    git worktree add "$claude_dir" -b pair-claude
+  }
+  git worktree add "$codex_dir" -b pair-codex 2>/dev/null || {
+    git branch -D pair-codex 2>/dev/null || true
+    git worktree add "$codex_dir" -b pair-codex
+  }
+
+  log_step "並行実装（worktree分離）"
+
+  # 並行実行
+  (
+    cd "$claude_dir"
+    log_claude "worktree: $claude_dir"
+    run_claude "以下のタスクを実装してください: ${TASK}" "${WORKDIR}/${LOG_DIR}/parallel_claude.log"
+    git add -A && git commit -m "pair: claude parallel" --no-verify 2>/dev/null || true
+  ) &
+  local claude_pid=$!
+
+  (
+    cd "$codex_dir"
+    log_codex "worktree: $codex_dir"
+    run_codex "以下のタスクを実装してください: ${TASK}" "${WORKDIR}/${LOG_DIR}/parallel_codex.log"
+    git add -A && git commit -m "pair: codex parallel" --no-verify 2>/dev/null || true
+  ) &
+  local codex_pid=$!
+
+  wait $claude_pid || true
+  wait $codex_pid || true
+
+  # マージ
+  log_step "マージ"
+  git merge pair-claude --no-edit 2>/dev/null || true
+  git merge pair-codex --no-edit 2>/dev/null || {
+    log_info "コンフリクト発生 → Claude に解決させます..."
+    run_claude "git merge のコンフリクトを解決してください。両方の実装の良い部分を残してください。
+タスク: ${TASK}" "${LOG_DIR}/merge_resolve.log"
+    git add -A
+    git commit -m "pair: merge resolution" --no-verify 2>/dev/null || true
+  }
+
+  # クリーンアップ
+  git worktree remove "$claude_dir" 2>/dev/null || true
+  git worktree remove "$codex_dir" 2>/dev/null || true
+  git branch -D pair-claude pair-codex 2>/dev/null || true
+}
+
+# ============================================================
+# メイン
+# ============================================================
+
+check_deps
+setup
+
+PAIR_START=$(date +%s)
+
+case "$MODE" in
+  ping-pong)        mode_ping_pong ;;
+  review)           mode_review ;;
+  implement-review) mode_implement_review ;;
+  parallel)         mode_parallel ;;
+  *)                log_error "不明なモード: $MODE"; usage ;;
+esac
+
+# --- サマリ ---
+PAIR_ELAPSED=$(( $(date +%s) - PAIR_START ))
+echo ""
+echo -e "${BOLD}╭──────────────────────────────────────╮${NC}"
+echo -e "${BOLD}│  ペアプロ完了                        │${NC}"
+echo -e "${BOLD}╰──────────────────────────────────────╯${NC}"
+echo ""
+log_info "合計時間: $(fmt_elapsed $PAIR_ELAPSED)"
+log_info "コミット履歴:"
+git log --oneline --graph -10 2>/dev/null || true
+echo ""
+log_info "ログ: ${LOG_DIR}/"
+
+# コスト集計（ログからUSD抽出）
+total_cost=0
+for f in "${LOG_DIR}"/*.log; do
+  [[ -f "$f" ]] || continue
+  cost=$(grep -o '"total_cost_usd":[0-9.]*' "$f" 2>/dev/null | tail -1 | cut -d: -f2)
+  if [[ -n "$cost" ]]; then
+    total_cost=$(echo "$total_cost + $cost" | bc 2>/dev/null || echo "$total_cost")
+  fi
+done
+if (( $(echo "$total_cost > 0" | bc 2>/dev/null || echo 0) )); then
+  log_info "合計コスト: \$${total_cost}"
+fi

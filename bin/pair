@@ -225,54 +225,61 @@ run_claude() {
 }
 
 # ============================================================
-# Codex ストリーミング実行（リアルタイム進捗表示）
+# Codex ストリーミング実行（リトライ + フォールバック付き）
 # ============================================================
-run_codex() {
+_run_codex_once() {
   local prompt="$1"
   local log_file="$2"
-  local codex_args=(exec --full-auto --json)
+  local use_json="$3"  # true/false
+  local codex_args=(exec --full-auto)
+  [[ "$use_json" == true ]] && codex_args+=(--json)
   [[ -n "$CODEX_MODEL" ]] && codex_args+=(-m "$CODEX_MODEL")
-
-  log_codex "開始..."
 
   local start_ts
   start_ts=$(date +%s)
 
-  (
-    npx @openai/codex "${codex_args[@]}" "$prompt" 2>/dev/null \
-      | tee "$log_file" \
-      | while IFS= read -r line; do
-          local msg_type
-          msg_type=$(echo "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
-          case "$msg_type" in
-            item.completed)
-              local item_type
-              item_type=$(echo "$line" | sed -n 's/.*"type":"\([^"]*\)".*"type":"\([^"]*\)".*/\2/p')
-              local elapsed=$(( $(date +%s) - start_ts ))
-              case "$item_type" in
-                tool_call|function_call)
-                  local tool_name
-                  tool_name=$(echo "$line" | sed -n 's/.*"name":"\([^"]*\)".*/\1/p' | head -1)
-                  echo -e "  \033[2m[$(fmt_elapsed $elapsed)]\033[0m \033[0;32m▶\033[0m ${tool_name:-tool}"
-                  ;;
-                agent_message)
-                  ;;
-              esac
-              ;;
-            turn.completed)
-              local elapsed=$(( $(date +%s) - start_ts ))
-              local in_tokens out_tokens
-              in_tokens=$(echo "$line" | sed -n 's/.*"input_tokens":\([0-9]*\).*/\1/p')
-              out_tokens=$(echo "$line" | sed -n 's/.*"output_tokens":\([0-9]*\).*/\1/p')
-              echo -e "  \033[0;32m✓\033[0m ターン完了 $(fmt_elapsed $elapsed) | in:${in_tokens:-?} out:${out_tokens:-?}"
-              ;;
-            thread.completed|exec.completed)
-              local elapsed=$(( $(date +%s) - start_ts ))
-              echo -e "  \033[0;32m✓\033[0m 完了 $(fmt_elapsed $elapsed)"
-              ;;
-          esac
-        done
-  ) &
+  if [[ "$use_json" == true ]]; then
+    # ストリーミング JSON モード（進捗表示あり）
+    (
+      npx @openai/codex "${codex_args[@]}" "$prompt" 2>/dev/null \
+        | tee "$log_file" \
+        | while IFS= read -r line; do
+            local msg_type
+            msg_type=$(echo "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
+            case "$msg_type" in
+              item.completed)
+                local item_type
+                item_type=$(echo "$line" | sed -n 's/.*"type":"\([^"]*\)".*"type":"\([^"]*\)".*/\2/p')
+                local elapsed=$(( $(date +%s) - start_ts ))
+                case "$item_type" in
+                  tool_call|function_call)
+                    local tool_name
+                    tool_name=$(echo "$line" | sed -n 's/.*"name":"\([^"]*\)".*/\1/p' | head -1)
+                    echo -e "  \033[2m[$(fmt_elapsed $elapsed)]\033[0m \033[0;32m▶\033[0m ${tool_name:-tool}"
+                    ;;
+                esac
+                ;;
+              turn.completed)
+                local elapsed=$(( $(date +%s) - start_ts ))
+                local in_tokens out_tokens
+                in_tokens=$(echo "$line" | sed -n 's/.*"input_tokens":\([0-9]*\).*/\1/p')
+                out_tokens=$(echo "$line" | sed -n 's/.*"output_tokens":\([0-9]*\).*/\1/p')
+                echo -e "  \033[0;32m✓\033[0m ターン完了 $(fmt_elapsed $elapsed) | in:${in_tokens:-?} out:${out_tokens:-?}"
+                ;;
+              thread.completed|exec.completed)
+                local elapsed=$(( $(date +%s) - start_ts ))
+                echo -e "  \033[0;32m✓\033[0m 完了 $(fmt_elapsed $elapsed)"
+                ;;
+            esac
+          done
+    ) &
+  else
+    # プレーンテキストモード（フォールバック）
+    (
+      npx @openai/codex "${codex_args[@]}" "$prompt" 2>/dev/null \
+        | tee "$log_file"
+    ) &
+  fi
   local pipeline_pid=$!
 
   # タイムアウト監視（0 = 無制限）
@@ -291,6 +298,46 @@ run_codex() {
   [[ -n "$watcher" ]] && kill "$watcher" 2>/dev/null
   [[ -n "$watcher" ]] && wait "$watcher" 2>/dev/null
   return $exit_code
+}
+
+run_codex() {
+  local prompt="$1"
+  local log_file="$2"
+  local max_retries=2
+
+  log_codex "開始..."
+
+  local attempt
+  for attempt in $(seq 1 $max_retries); do
+    # 初回は --json 付き、リトライはなしで試す
+    local use_json=true
+    if (( attempt > 1 )); then
+      use_json=false
+      log_codex "リトライ ${attempt}/${max_retries}（--json なしフォールバック）..."
+      sleep 2
+    fi
+
+    _run_codex_once "$prompt" "$log_file" "$use_json"
+    local exit_code=$?
+
+    # 成功 or タイムアウト → 終了
+    if (( exit_code == 0 )); then
+      return 0
+    fi
+
+    # segfault (139) / abort (134) / signal系 (128+) → リトライ
+    if (( exit_code >= 128 && attempt < max_retries )); then
+      log_error "Codex クラッシュ (exit ${exit_code})。リトライします..."
+      : > "$log_file"  # ログクリア
+      continue
+    fi
+
+    # その他のエラー → 終了
+    log_error "Codex 失敗 (exit ${exit_code})"
+    return $exit_code
+  done
+
+  return 1
 }
 
 # --- diff を取得（最大行数制限付き） ---

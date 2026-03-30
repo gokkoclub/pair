@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 675" font-family="'Helvetica Neue', Arial, sans-serif">
+  <defs>
+    <linearGradient id="bg2" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#0f0f23"/>
+      <stop offset="100%" style="stop-color:#1a1a3e"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="675" fill="url(#bg2)"/>
+  <!-- section label -->
+  <text x="80" y="80" fill="#6366f1" font-size="16" font-weight="600" letter-spacing="3">MOTIVATION</text>
+  <text x="80" y="130" fill="#ffffff" font-size="42" font-weight="700">なぜ AI 同士でペアプロするのか？</text>
+  <!-- problem cards -->
+  <rect x="80" y="180" width="500" height="120" rx="12" fill="#1e1e2e" stroke="#ef4444" stroke-width="1" opacity="0.9"/>
+  <text x="108" y="220" fill="#ef4444" font-size="18" font-weight="600">❌ 単一AIの限界</text>
+  <text x="108" y="250" fill="#94a3b8" font-size="15">自分の書いたコードの問題に気づきにくい</text>
+  <text x="108" y="275" fill="#94a3b8" font-size="15">一方向の思考に偏りがち</text>
+  <rect x="620" y="180" width="500" height="120" rx="12" fill="#1e1e2e" stroke="#ef4444" stroke-width="1" opacity="0.9"/>
+  <text x="648" y="220" fill="#ef4444" font-size="18" font-weight="600">❌ 人間レビューのコスト</text>
+  <text x="648" y="250" fill="#94a3b8" font-size="15">AIの出力を全部読むのは大変</text>
+  <text x="648" y="275" fill="#94a3b8" font-size="15">コンテキストスイッチが重い</text>
+  <!-- arrow -->
+  <text x="560" y="370" fill="#64748b" font-size="28">↓</text>
+  <!-- solution cards -->
+  <rect x="80" y="400" width="500" height="140" rx="12" fill="#1e1e2e" stroke="#22c55e" stroke-width="1.5" opacity="0.9"/>
+  <text x="108" y="440" fill="#22c55e" font-size="18" font-weight="600">✅ 異なるモデルの視点</text>
+  <text x="108" y="470" fill="#94a3b8" font-size="15">Claude（深い推論）× Codex（実行重視）</text>
+  <text x="108" y="495" fill="#94a3b8" font-size="15">互いの盲点を補完し合う</text>
+  <text x="108" y="520" fill="#64748b" font-size="13">→ モデルの多様性がコード品質を上げる</text>
+  <rect x="620" y="400" width="500" height="140" rx="12" fill="#1e1e2e" stroke="#22c55e" stroke-width="1.5" opacity="0.9"/>
+  <text x="648" y="440" fill="#22c55e" font-size="18" font-weight="600">✅ 人間は意思決定に集中</text>
+  <text x="648" y="470" fill="#94a3b8" font-size="15">AIがレビューし合った結果だけ確認</text>
+  <text x="648" y="495" fill="#94a3b8" font-size="15">タスクを投げたら完了を待つだけ</text>
+  <text x="648" y="520" fill="#64748b" font-size="13">→ 人間の認知負荷を大幅に削減</text>
+  <rect x="0" y="655" width="1200" height="20" fill="#6366f1" opacity="0.2"/>
+</svg>

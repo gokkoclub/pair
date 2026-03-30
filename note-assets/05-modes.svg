@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 675" font-family="'Helvetica Neue', Arial, sans-serif">
+  <defs>
+    <linearGradient id="bg5" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#0f0f23"/>
+      <stop offset="100%" style="stop-color:#1a1a3e"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="675" fill="url(#bg5)"/>
+  <text x="80" y="80" fill="#6366f1" font-size="16" font-weight="600" letter-spacing="3">MODES</text>
+  <text x="80" y="125" fill="#ffffff" font-size="38" font-weight="700">4つのペアプロモード</text>
+  <!-- Mode 1: ping-pong -->
+  <rect x="80" y="170" width="520" height="110" rx="12" fill="#1e1e2e" stroke="#6366f1" stroke-width="1.5"/>
+  <text x="110" y="205" fill="#6366f1" font-size="18" font-weight="700">🏓 ping-pong（デフォルト）</text>
+  <text x="110" y="230" fill="#94a3b8" font-size="14">Claude → Codex → Claude → Codex ... を繰り返す</text>
+  <text x="110" y="255" fill="#64748b" font-size="13">新規実装、大きなリファクタに最適</text>
+  <text x="490" y="205" fill="#475569" font-size="12" font-family="monospace">pair "認証を実装"</text>
+  <!-- Mode 2: review -->
+  <rect x="80" y="300" width="520" height="110" rx="12" fill="#1e1e2e" stroke="#22c55e" stroke-width="1.5"/>
+  <text x="110" y="335" fill="#22c55e" font-size="18" font-weight="700">🔍 review</text>
+  <text x="110" y="360" fill="#94a3b8" font-size="14">片方が実装 → もう片方がレビュー＆修正</text>
+  <text x="110" y="385" fill="#64748b" font-size="13">既存コードの改善、バグ修正に最適</text>
+  <text x="440" y="335" fill="#475569" font-size="12" font-family="monospace">pair --mode review "..."</text>
+  <!-- Mode 3: implement-review -->
+  <rect x="620" y="170" width="500" height="110" rx="12" fill="#1e1e2e" stroke="#f59e0b" stroke-width="1.5"/>
+  <text x="650" y="205" fill="#f59e0b" font-size="18" font-weight="700">📋 implement-review</text>
+  <text x="650" y="230" fill="#94a3b8" font-size="14">Claude実装 → Codexレビュー → Claude修正</text>
+  <text x="650" y="255" fill="#64748b" font-size="13">3ステップで品質を担保。レビューが review.md に残る</text>
+  <!-- Mode 4: parallel -->
+  <rect x="620" y="300" width="500" height="110" rx="12" fill="#1e1e2e" stroke="#ec4899" stroke-width="1.5"/>
+  <text x="650" y="335" fill="#ec4899" font-size="18" font-weight="700">⚡ parallel</text>
+  <text x="650" y="360" fill="#94a3b8" font-size="14">両方が同時に実装 → git worktree → マージ</text>
+  <text x="650" y="385" fill="#64748b" font-size="13">速度重視。コンフリクトはClaudeが自動解決</text>
+  <!-- Comparison -->
+  <rect x="80" y="440" width="1040" height="180" rx="12" fill="#1e1e2e" stroke="#334155" stroke-width="1"/>
+  <text x="110" y="475" fill="#e2e8f0" font-size="16" font-weight="700">使い分けガイド</text>
+  <!-- Headers -->
+  <text x="110" y="510" fill="#64748b" font-size="13" font-weight="600">場面</text>
+  <text x="430" y="510" fill="#64748b" font-size="13" font-weight="600">おすすめモード</text>
+  <text x="700" y="510" fill="#64748b" font-size="13" font-weight="600">理由</text>
+  <rect x="110" y="518" width="980" height="1" fill="#334155"/>
+  <!-- Row 1 -->
+  <text x="110" y="545" fill="#94a3b8" font-size="14">ゼロから機能実装</text>
+  <text x="430" y="545" fill="#6366f1" font-size="14" font-weight="600">ping-pong</text>
+  <text x="700" y="545" fill="#94a3b8" font-size="14">複数ラウンドで段階的に品質向上</text>
+  <!-- Row 2 -->
+  <text x="110" y="572" fill="#94a3b8" font-size="14">既存コードの改善</text>
+  <text x="430" y="572" fill="#22c55e" font-size="14" font-weight="600">review</text>
+  <text x="700" y="572" fill="#94a3b8" font-size="14">実装者とレビュアーの役割分担が明確</text>
+  <!-- Row 3 -->
+  <text x="110" y="599" fill="#94a3b8" font-size="14">とにかく速く</text>
+  <text x="430" y="599" fill="#ec4899" font-size="14" font-weight="600">parallel</text>
+  <text x="700" y="599" fill="#94a3b8" font-size="14">2倍の計算リソースで時間短縮</text>
+  <rect x="0" y="655" width="1200" height="20" fill="#6366f1" opacity="0.2"/>
+</svg>

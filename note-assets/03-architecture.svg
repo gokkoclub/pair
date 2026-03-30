@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 675" font-family="'Helvetica Neue', Arial, sans-serif">
+  <defs>
+    <linearGradient id="bg3" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#0f0f23"/>
+      <stop offset="100%" style="stop-color:#1a1a3e"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="675" fill="url(#bg3)"/>
+  <text x="80" y="80" fill="#6366f1" font-size="16" font-weight="600" letter-spacing="3">RELAY MODE</text>
+  <text x="80" y="125" fill="#ffffff" font-size="38" font-weight="700">リレー方式：交代で実装・改善</text>
+  <!-- Flow diagram -->
+  <!-- Round 1 -->
+  <text x="80" y="195" fill="#64748b" font-size="14" font-weight="600">ROUND 1</text>
+  <!-- Claude box -->
+  <rect x="80" y="210" width="220" height="90" rx="10" fill="#1e1e2e" stroke="#6366f1" stroke-width="2"/>
+  <text x="115" y="245" fill="#6366f1" font-size="16" font-weight="700">🟣 Claude</text>
+  <text x="115" y="270" fill="#94a3b8" font-size="13">タスクを実装</text>
+  <text x="115" y="288" fill="#64748b" font-size="11">+ ハンドオフメモ作成</text>
+  <!-- Arrow -->
+  <line x1="310" y1="255" x2="370" y2="255" stroke="#475569" stroke-width="2" marker-end="url(#arrowhead)"/>
+  <text x="315" y="245" fill="#475569" font-size="11">diff +</text>
+  <text x="315" y="260" fill="#475569" font-size="11">メモ</text>
+  <!-- Codex box -->
+  <rect x="380" y="210" width="220" height="90" rx="10" fill="#1e1e2e" stroke="#22c55e" stroke-width="2"/>
+  <text x="415" y="245" fill="#22c55e" font-size="16" font-weight="700">🟢 Codex</text>
+  <text x="415" y="270" fill="#94a3b8" font-size="13">レビュー &amp; 改善</text>
+  <text x="415" y="288" fill="#64748b" font-size="11">+ ハンドオフメモ作成</text>
+  <!-- Round 2 -->
+  <text x="80" y="345" fill="#64748b" font-size="14" font-weight="600">ROUND 2</text>
+  <rect x="80" y="360" width="220" height="90" rx="10" fill="#1e1e2e" stroke="#6366f1" stroke-width="2"/>
+  <text x="115" y="395" fill="#6366f1" font-size="16" font-weight="700">🟣 Claude</text>
+  <text x="115" y="420" fill="#94a3b8" font-size="13">Codexの修正を確認・発展</text>
+  <line x1="310" y1="405" x2="370" y2="405" stroke="#475569" stroke-width="2"/>
+  <rect x="380" y="360" width="220" height="90" rx="10" fill="#1e1e2e" stroke="#22c55e" stroke-width="2"/>
+  <text x="415" y="395" fill="#22c55e" font-size="16" font-weight="700">🟢 Codex</text>
+  <text x="415" y="420" fill="#94a3b8" font-size="13">仕上げ &amp; 最終レビュー</text>
+  <!-- Handoff memo -->
+  <rect x="700" y="210" width="420" height="250" rx="12" fill="#1e1e2e" stroke="#f59e0b" stroke-width="1.5"/>
+  <text x="728" y="245" fill="#f59e0b" font-size="15" font-weight="700">📝 ハンドオフメモ（.pair-handoff.md）</text>
+  <text x="728" y="280" fill="#e2e8f0" font-size="14" font-weight="600">## やったこと</text>
+  <text x="728" y="302" fill="#94a3b8" font-size="13">- 認証ミドルウェアを追加</text>
+  <text x="728" y="322" fill="#94a3b8" font-size="13">- JWT検証のユーティリティ関数を作成</text>
+  <text x="728" y="350" fill="#e2e8f0" font-size="14" font-weight="600">## 判断の理由</text>
+  <text x="728" y="372" fill="#94a3b8" font-size="13">- sessionよりJWTを選んだ（ステートレス）</text>
+  <text x="728" y="400" fill="#e2e8f0" font-size="14" font-weight="600">## 次のパートナーへ</text>
+  <text x="728" y="422" fill="#94a3b8" font-size="13">- リフレッシュトークンが未実装</text>
+  <text x="728" y="442" fill="#94a3b8" font-size="13">- エラーレスポンスの形式を統一したい</text>
+  <!-- key point -->
+  <rect x="80" y="500" width="1040" height="80" rx="10" fill="#1e1e2e" stroke="#334155" stroke-width="1"/>
+  <text x="120" y="535" fill="#f59e0b" font-size="16" font-weight="600">💡 ポイント：diff だけでなく「意図」を伝える</text>
+  <text x="120" y="560" fill="#94a3b8" font-size="14">ハンドオフメモにより、なぜその実装にしたか・何が残っているかが次のパートナーに伝わる</text>
+  <rect x="0" y="655" width="1200" height="20" fill="#6366f1" opacity="0.2"/>
+</svg>
